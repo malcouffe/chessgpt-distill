@@ -20,6 +20,7 @@ import argparse
 import json
 import os
 import tempfile
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -149,25 +150,66 @@ def main():
 
     count = 0
     games = 0
+    scanned = 0
+    filtered = 0
     t0 = time.time()
-    batch_size = args.num_workers * 2  # keep the thread pool fed
+    last_log = t0
 
     with StockfishPool(sf_cfg) as pool, open(local_path, "w") as fout:
         executor = ThreadPoolExecutor(max_workers=args.num_workers)
+        pending_futures: dict = {}
+        write_lock = threading.Lock()
+
+        def _drain_completed():
+            """Drain completed futures and write results."""
+            nonlocal count, games
+            done = [f for f in pending_futures if f.done()]
+            for f in done:
+                del pending_futures[f]
+                record, n_positions = f.result()
+                if record is not None:
+                    with write_lock:
+                        fout.write(json.dumps(record, ensure_ascii=False) + "\n")
+                    count += n_positions
+                    games += 1
+
+        def _log_progress(force: bool = False):
+            nonlocal last_log
+            now = time.time()
+            if not force and now - last_log < 10:
+                return
+            last_log = now
+            elapsed = now - t0
+            rate = count / elapsed if elapsed > 0 else 0
+            eta = (args.num_positions - count) / rate if rate > 0 else 0
+            print(
+                f"  {count:>10,} / {args.num_positions:,} "
+                f"({count / args.num_positions:.1%}) "
+                f"| {games:,} games "
+                f"| scanned {scanned:,} (kept {filtered:,}) "
+                f"| in-flight {len(pending_futures)} "
+                f"| {rate:.0f} pos/s "
+                f"| ETA {eta / 3600:.1f}h",
+                flush=True,
+            )
 
         for ds_name in args.datasets:
             if count >= args.num_positions:
                 break
 
-            print(f"\nLoading {ds_name} ...")
+            print(f"\nLoading {ds_name} ...", flush=True)
             ds = load_dataset(ds_name, split="train", streaming=True)
-
-            # Collect a batch of games, submit them in parallel, drain results
-            batch = []
 
             for example in ds:
                 if count >= args.num_positions:
                     break
+
+                scanned += 1
+
+                # Log scanning progress every 10s
+                if scanned % 1000 == 0:
+                    _drain_completed()
+                    _log_progress()
 
                 white_elo = example.get("white_elo", 0)
                 black_elo = example.get("black_elo", 0)
@@ -178,58 +220,34 @@ def main():
                 if len(moves_uci) < 10:
                     continue
 
-                batch.append(moves_uci)
+                filtered += 1
 
-                if len(batch) >= batch_size:
-                    # Submit batch in parallel
-                    futures = {
-                        executor.submit(
-                            annotate_game, pool, tokenizer, moves,
-                            sample_every=args.sample_every,
-                            top_n=args.top_n,
-                            sf_depth=args.sf_depth,
-                            max_seq_len=args.max_seq_len,
-                        ): moves
-                        for moves in batch
-                    }
-                    for future in as_completed(futures):
-                        record, n_positions = future.result()
-                        if record is not None:
-                            fout.write(json.dumps(record, ensure_ascii=False) + "\n")
-                            count += n_positions
-                            games += 1
-                    batch.clear()
+                # Submit immediately — no batching
+                fut = executor.submit(
+                    annotate_game, pool, tokenizer, moves_uci,
+                    sample_every=args.sample_every,
+                    top_n=args.top_n,
+                    sf_depth=args.sf_depth,
+                    max_seq_len=args.max_seq_len,
+                )
+                pending_futures[fut] = True
 
-                    if count % 1000 < batch_size * 5:
-                        elapsed = time.time() - t0
-                        rate = count / elapsed if elapsed > 0 else 0
-                        eta = (args.num_positions - count) / rate if rate > 0 else 0
-                        print(
-                            f"  {count:>10,} / {args.num_positions:,} "
-                            f"({count / args.num_positions:.1%}) "
-                            f"| {games:,} games "
-                            f"| {rate:.0f} pos/s "
-                            f"| ETA {eta / 3600:.1f}h",
-                        )
+                # Throttle: if too many in-flight, drain some
+                while len(pending_futures) >= args.num_workers * 3:
+                    _drain_completed()
+                    _log_progress()
+                    if len(pending_futures) >= args.num_workers * 3:
+                        time.sleep(0.1)
 
-            # Drain remaining batch
-            if batch and count < args.num_positions:
-                futures = {
-                    executor.submit(
-                        annotate_game, pool, tokenizer, moves,
-                        sample_every=args.sample_every,
-                        top_n=args.top_n,
-                        sf_depth=args.sf_depth,
-                        max_seq_len=args.max_seq_len,
-                    ): moves
-                    for moves in batch
-                }
-                for future in as_completed(futures):
-                    record, n_positions = future.result()
-                    if record is not None:
-                        fout.write(json.dumps(record, ensure_ascii=False) + "\n")
-                        count += n_positions
-                        games += 1
+        # Drain all remaining futures
+        print(f"\nDraining {len(pending_futures)} remaining futures...", flush=True)
+        for fut in as_completed(pending_futures):
+            record, n_positions = fut.result()
+            if record is not None:
+                fout.write(json.dumps(record, ensure_ascii=False) + "\n")
+                count += n_positions
+                games += 1
+        _log_progress(force=True)
 
         executor.shutdown(wait=True)
 
