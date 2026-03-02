@@ -21,6 +21,7 @@ import json
 import os
 import tempfile
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import chess
 from datasets import Dataset, load_dataset
@@ -113,7 +114,9 @@ def main():
                         help="Number of Stockfish top moves to record")
     parser.add_argument("--sf_depth", type=int, default=18)
     parser.add_argument("--max_seq_len", type=int, default=256)
-    parser.add_argument("--num_engines", type=int, default=8)
+    parser.add_argument("--num_engines", type=int, default=80)
+    parser.add_argument("--num_workers", type=int, default=64,
+                        help="Number of parallel game annotation threads")
     parser.add_argument("--stockfish_path", type=str, default="stockfish")
     parser.add_argument("--datasets", nargs="+", default=[
         "malcouffe/lichess-standard-rated-2025-07-uci",
@@ -139,6 +142,7 @@ def main():
 
     print(f"Target: {args.num_positions:,} positions")
     print(f"Stockfish: depth={args.sf_depth}, top_n={args.top_n}, engines={args.num_engines}")
+    print(f"Workers: {args.num_workers}")
     print(f"Max seq len: {args.max_seq_len}")
     print(f"Datasets: {len(args.datasets)}")
     print(f"HF Hub repo: {args.output}")
@@ -146,14 +150,20 @@ def main():
     count = 0
     games = 0
     t0 = time.time()
+    batch_size = args.num_workers * 2  # keep the thread pool fed
 
     with StockfishPool(sf_cfg) as pool, open(local_path, "w") as fout:
+        executor = ThreadPoolExecutor(max_workers=args.num_workers)
+
         for ds_name in args.datasets:
             if count >= args.num_positions:
                 break
 
             print(f"\nLoading {ds_name} ...")
             ds = load_dataset(ds_name, split="train", streaming=True)
+
+            # Collect a batch of games, submit them in parallel, drain results
+            batch = []
 
             for example in ds:
                 if count >= args.num_positions:
@@ -168,22 +178,31 @@ def main():
                 if len(moves_uci) < 10:
                     continue
 
-                record, n_positions = annotate_game(
-                    pool, tokenizer, moves_uci,
-                    sample_every=args.sample_every,
-                    top_n=args.top_n,
-                    sf_depth=args.sf_depth,
-                    max_seq_len=args.max_seq_len,
-                )
+                batch.append(moves_uci)
 
-                if record is not None:
-                    fout.write(json.dumps(record, ensure_ascii=False) + "\n")
-                    count += n_positions
-                    games += 1
+                if len(batch) >= batch_size:
+                    # Submit batch in parallel
+                    futures = {
+                        executor.submit(
+                            annotate_game, pool, tokenizer, moves,
+                            sample_every=args.sample_every,
+                            top_n=args.top_n,
+                            sf_depth=args.sf_depth,
+                            max_seq_len=args.max_seq_len,
+                        ): moves
+                        for moves in batch
+                    }
+                    for future in as_completed(futures):
+                        record, n_positions = future.result()
+                        if record is not None:
+                            fout.write(json.dumps(record, ensure_ascii=False) + "\n")
+                            count += n_positions
+                            games += 1
+                    batch.clear()
 
-                    if count % 1000 < n_positions:
+                    if count % 1000 < batch_size * 5:
                         elapsed = time.time() - t0
-                        rate = count / elapsed
+                        rate = count / elapsed if elapsed > 0 else 0
                         eta = (args.num_positions - count) / rate if rate > 0 else 0
                         print(
                             f"  {count:>10,} / {args.num_positions:,} "
@@ -192,6 +211,27 @@ def main():
                             f"| {rate:.0f} pos/s "
                             f"| ETA {eta / 3600:.1f}h",
                         )
+
+            # Drain remaining batch
+            if batch and count < args.num_positions:
+                futures = {
+                    executor.submit(
+                        annotate_game, pool, tokenizer, moves,
+                        sample_every=args.sample_every,
+                        top_n=args.top_n,
+                        sf_depth=args.sf_depth,
+                        max_seq_len=args.max_seq_len,
+                    ): moves
+                    for moves in batch
+                }
+                for future in as_completed(futures):
+                    record, n_positions = future.result()
+                    if record is not None:
+                        fout.write(json.dumps(record, ensure_ascii=False) + "\n")
+                        count += n_positions
+                        games += 1
+
+        executor.shutdown(wait=True)
 
     elapsed = time.time() - t0
     print(f"\nDone: {count:,} positions from {games:,} games in {elapsed / 3600:.1f}h")
