@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import argparse
 import glob
-import json
 import os
 import signal
 import sys
@@ -24,6 +23,7 @@ from dataclasses import asdict, dataclass, field
 
 import torch
 import torch.nn.functional as F
+from datasets import load_dataset as hf_load_dataset
 from torch.utils.data import DataLoader, Dataset
 
 from chessgpt import (
@@ -228,12 +228,9 @@ def distill_collate_fn(batch: list[dict]) -> dict:
 
 
 def load_distill_data(path: str) -> list[dict]:
-    """Load JSONL distillation data."""
-    data = []
-    with open(path) as f:
-        for line in f:
-            data.append(json.loads(line))
-    return data
+    """Load distillation data from a HF Hub dataset."""
+    ds = hf_load_dataset(path, split="train")
+    return [row for row in ds]
 
 
 # ---------------------------------------------------------------------------

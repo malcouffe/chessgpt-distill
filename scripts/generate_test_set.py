@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """Generate a test set of chess positions from Lichess games for evaluation.
 
-Extracts positions at various game phases from high-ELO games,
-saving them as JSONL for use with scripts/evaluate.py.
+Extracts positions at various game phases from high-ELO games
+and uploads them to Hugging Face Hub.
 
 Usage:
     python scripts/generate_test_set.py \
-        --output data/test_positions.jsonl \
+        --output malcouffe/chessgpt-test-positions \
         --num_positions 10000 \
         --min_elo 2200
 """
@@ -17,9 +17,9 @@ import argparse
 import json
 import os
 import random
-import sys
+import tempfile
 
-from datasets import load_dataset
+from datasets import Dataset, load_dataset
 
 # Phase boundaries (in half-moves / plies)
 OPENING_END = 30     # moves 1-15
@@ -64,7 +64,8 @@ def extract_positions_from_game(
 
 def main():
     parser = argparse.ArgumentParser(description="Generate test positions from Lichess games")
-    parser.add_argument("--output", type=str, default="data/test_positions.jsonl")
+    parser.add_argument("--output", type=str, default="malcouffe/chessgpt-test-positions",
+                        help="HF Hub repo name (e.g. malcouffe/chessgpt-test-positions)")
     parser.add_argument("--num_positions", type=int, default=10_000)
     parser.add_argument("--min_elo", type=int, default=2200)
     parser.add_argument("--sample_every", type=int, default=5,
@@ -124,15 +125,16 @@ def main():
             if all(len(collected[p]) >= targets[p] for p in targets):
                 break
 
-    # Combine, shuffle, and write
+    # Combine, shuffle
     all_positions = []
     for phase in collected:
         all_positions.extend(collected[phase][:targets[phase]])
 
     random.shuffle(all_positions)
 
-    os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
-    with open(args.output, "w") as f:
+    # Write to temp file then upload to HF Hub
+    local_path = os.path.join(tempfile.gettempdir(), "test_positions.jsonl")
+    with open(local_path, "w") as f:
         for pos in all_positions:
             f.write(json.dumps(pos, ensure_ascii=False) + "\n")
 
@@ -141,9 +143,15 @@ def main():
     for pos in all_positions:
         phase_counts[pos["phase"]] = phase_counts.get(pos["phase"], 0) + 1
 
-    print(f"\nWrote {total} positions to {args.output}")
+    print(f"\nGenerated {total} positions")
     for phase, count in sorted(phase_counts.items()):
         print(f"  {phase}: {count}")
+
+    print(f"\nUploading to {args.output} ...")
+    hf_dataset = Dataset.from_json(local_path)
+    hf_dataset.push_to_hub(args.output)
+    print(f"Uploaded to https://huggingface.co/datasets/{args.output}")
+    os.remove(local_path)
 
 
 if __name__ == "__main__":

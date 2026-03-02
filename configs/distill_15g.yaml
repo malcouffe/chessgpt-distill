@@ -12,7 +12,7 @@ model:
   dropout: 0.05
 
 data:
-  train_path: "data/sf_distill.jsonl"
+  train_path: "malcouffe/chessgpt-sf-distill"
   val_ratio: 0.01
   batch_size: 16
   max_seq_len: 256

@@ -7,7 +7,7 @@ One JSONL record per game with multiple annotated positions.
 
 Usage:
     python scripts/generate_sf_data.py \
-        --output data/sf_distill.jsonl \
+        --output malcouffe/chessgpt-sf-distill \
         --num_positions 5000000 \
         --sf_depth 18 \
         --num_engines 8 \
@@ -19,10 +19,11 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import tempfile
 import time
 
 import chess
-from datasets import load_dataset
+from datasets import Dataset, load_dataset
 
 from chessgpt import UCITokenizer
 from chessgpt_distill.stockfish import StockfishConfig, StockfishPool
@@ -102,7 +103,8 @@ def annotate_game(
 
 def main():
     parser = argparse.ArgumentParser(description="Generate Stockfish-annotated dataset")
-    parser.add_argument("--output", type=str, default="data/sf_distill.jsonl")
+    parser.add_argument("--output", type=str, default="malcouffe/chessgpt-sf-distill",
+                        help="HF Hub repo name (e.g. malcouffe/chessgpt-sf-distill)")
     parser.add_argument("--num_positions", type=int, default=5_000_000)
     parser.add_argument("--min_elo", type=int, default=1800)
     parser.add_argument("--sample_every", type=int, default=8,
@@ -133,18 +135,19 @@ def main():
         num_engines=args.num_engines,
     )
 
-    os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
+    local_path = os.path.join(tempfile.gettempdir(), "sf_distill.jsonl")
 
     print(f"Target: {args.num_positions:,} positions")
     print(f"Stockfish: depth={args.sf_depth}, top_n={args.top_n}, engines={args.num_engines}")
     print(f"Max seq len: {args.max_seq_len}")
     print(f"Datasets: {len(args.datasets)}")
+    print(f"HF Hub repo: {args.output}")
 
     count = 0
     games = 0
     t0 = time.time()
 
-    with StockfishPool(sf_cfg) as pool, open(args.output, "w") as fout:
+    with StockfishPool(sf_cfg) as pool, open(local_path, "w") as fout:
         for ds_name in args.datasets:
             if count >= args.num_positions:
                 break
@@ -192,7 +195,13 @@ def main():
 
     elapsed = time.time() - t0
     print(f"\nDone: {count:,} positions from {games:,} games in {elapsed / 3600:.1f}h")
-    print(f"Output: {args.output}")
+
+    # Upload to Hugging Face Hub
+    print(f"\nUploading to {args.output} ...")
+    hf_dataset = Dataset.from_json(local_path)
+    hf_dataset.push_to_hub(args.output)
+    print(f"Uploaded to https://huggingface.co/datasets/{args.output}")
+    os.remove(local_path)
 
 
 if __name__ == "__main__":

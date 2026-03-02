@@ -14,11 +14,11 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import json
 import sys
 import time
 
 import torch
+from datasets import load_dataset as hf_load_dataset
 
 from chessgpt import ChessGPT, ChessGPTConfig, UCITokenizer, resolve_device
 from chessgpt_distill.evaluation import Position, full_evaluation
@@ -62,18 +62,17 @@ def load_checkpoint(checkpoint_path: str, device: torch.device):
 # ---------------------------------------------------------------------------
 
 def load_test_set(path: str, max_positions: int = 0) -> list[Position]:
+    ds = hf_load_dataset(path, split="train")
     positions = []
-    with open(path) as f:
-        for line in f:
-            d = json.loads(line)
-            positions.append(Position(
-                move_history=d["move_history"],
-                phase=d["phase"],
-                expected_move=d.get("expected_move"),
-                elo=d.get("elo"),
-            ))
-            if 0 < max_positions <= len(positions):
-                break
+    for d in ds:
+        positions.append(Position(
+            move_history=d["move_history"],
+            phase=d["phase"],
+            expected_move=d.get("expected_move"),
+            elo=d.get("elo"),
+        ))
+        if 0 < max_positions <= len(positions):
+            break
     return positions
 
 
@@ -84,7 +83,8 @@ def load_test_set(path: str, max_positions: int = 0) -> list[Position]:
 def main():
     parser = argparse.ArgumentParser(description="Evaluate ChessGPT on test positions")
     parser.add_argument("--checkpoint", type=str, required=True)
-    parser.add_argument("--test_set", type=str, default="data/test_positions.jsonl")
+    parser.add_argument("--test_set", type=str, default="malcouffe/chessgpt-test-positions",
+                        help="HF Hub dataset repo name")
     parser.add_argument("--device", type=str, default="auto")
     parser.add_argument("--stockfish_path", type=str, default="stockfish")
     parser.add_argument("--sf_depth", type=int, default=15)
