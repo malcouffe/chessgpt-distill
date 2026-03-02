@@ -216,7 +216,7 @@ def main():
                 if white_elo < args.min_elo or black_elo < args.min_elo:
                     continue
 
-                moves_uci = example.get("moves", "").strip().split()
+                moves_uci = (example.get("moves_uci") or example.get("moves", "")).strip().split()
                 if len(moves_uci) < 10:
                     continue
 

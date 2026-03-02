@@ -105,7 +105,7 @@ def main():
             if white_elo < args.min_elo or black_elo < args.min_elo:
                 continue
 
-            moves_uci = example.get("moves", "")
+            moves_uci = example.get("moves_uci") or example.get("moves", "")
             positions = extract_positions_from_game(
                 moves_uci, white_elo, black_elo,
                 sample_every=args.sample_every,
