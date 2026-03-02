@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "chessgpt-distill"
+version = "0.1.0"
+description = "Stockfish distillation pipeline for ChessGPT (data generation, training, evaluation)"
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.0",
+    "python-chess>=1.10",
+    "pyyaml>=6.0",
+    "accelerate>=0.25",
+    "huggingface_hub>=0.20",
+    "datasets>=2.25",
+]
+
+[tool.setuptools.packages.find]
+include = ["chessgpt_distill*"]
