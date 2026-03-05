@@ -237,35 +237,74 @@ def load_distill_data(path: str) -> list[dict]:
 # ---------------------------------------------------------------------------
 
 
-def load_pretrained(checkpoint_path: str, device: torch.device, dropout_override: float | None = None):
-    """Load a pre-trained ChessGPT model from checkpoint."""
-    ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
-
-    if "config" in ckpt and "model" in ckpt.get("config", {}):
-        model_d = ckpt["config"]["model"]
-    else:
-        model_d = ckpt.get("train_config", {})
-
+def load_pretrained(checkpoint_path: str, device: torch.device,
+                    model_cfg_override: ModelConfig | None = None,
+                    dropout_override: float | None = None):
+    """Load a pre-trained ChessGPT model from checkpoint (.pt) or safetensors directory."""
     tokenizer = UCITokenizer()
 
-    dropout = float(model_d.get("dropout", 0.0))
-    if dropout_override is not None:
-        dropout = dropout_override
+    # Resolve path: directory → find .safetensors or .pt inside
+    path = checkpoint_path
+    if os.path.isdir(path):
+        for name in ("model.safetensors", "checkpoint.pt", "latest.pt"):
+            candidate = os.path.join(path, name)
+            if os.path.exists(candidate):
+                path = candidate
+                break
 
-    model_cfg = ChessGPTConfig(
-        vocab_size=tokenizer.vocab_size,
-        d_model=int(model_d.get("d_model", 256)),
-        n_layers=int(model_d.get("n_layers", 8)),
-        n_heads=int(model_d.get("n_heads", 8)),
-        d_ff=int(model_d.get("d_ff", 1024)),
-        max_seq_len=int(model_d.get("max_seq_len", 256)),
-        dropout=dropout,
-    )
+    if path.endswith(".safetensors"):
+        from safetensors.torch import load_file
+        state_dict = load_file(path, device=str(device))
+        step = 0
 
-    model = ChessGPT(model_cfg).to(device)
-    model.load_state_dict(ckpt["model_state_dict"], strict=False)
+        # Use config from yaml (model_cfg_override) since safetensors has no config
+        if model_cfg_override is None:
+            print("Error: model config must be provided in yaml when loading safetensors")
+            sys.exit(1)
 
-    step = ckpt.get("step", 0)
+        dropout = model_cfg_override.dropout
+        if dropout_override is not None:
+            dropout = dropout_override
+
+        model_cfg = ChessGPTConfig(
+            vocab_size=tokenizer.vocab_size,
+            d_model=model_cfg_override.d_model,
+            n_layers=model_cfg_override.n_layers,
+            n_heads=model_cfg_override.n_heads,
+            d_ff=model_cfg_override.d_ff,
+            max_seq_len=model_cfg_override.max_seq_len,
+            dropout=dropout,
+        )
+
+        model = ChessGPT(model_cfg).to(device)
+        model.load_state_dict(state_dict, strict=False)
+
+    else:
+        ckpt = torch.load(path, map_location=device, weights_only=False)
+
+        if "config" in ckpt and "model" in ckpt.get("config", {}):
+            model_d = ckpt["config"]["model"]
+        else:
+            model_d = ckpt.get("train_config", {})
+
+        dropout = float(model_d.get("dropout", 0.0))
+        if dropout_override is not None:
+            dropout = dropout_override
+
+        model_cfg = ChessGPTConfig(
+            vocab_size=tokenizer.vocab_size,
+            d_model=int(model_d.get("d_model", 256)),
+            n_layers=int(model_d.get("n_layers", 8)),
+            n_heads=int(model_d.get("n_heads", 8)),
+            d_ff=int(model_d.get("d_ff", 1024)),
+            max_seq_len=int(model_d.get("max_seq_len", 256)),
+            dropout=dropout,
+        )
+
+        model = ChessGPT(model_cfg).to(device)
+        model.load_state_dict(ckpt["model_state_dict"], strict=False)
+        step = ckpt.get("step", 0)
+
     print(f"  Loaded pre-trained model from step {step}, params: {model.count_parameters():,}")
     if dropout_override is not None:
         print(f"  Dropout overridden to {dropout_override}")
@@ -361,7 +400,10 @@ def train(cfg: DistillConfig):
 
     print(f"Loading pre-trained model: {cfg.pretrained_checkpoint}")
     dropout = cfg.model.dropout if cfg.model.dropout > 0.0 else None
-    model, tokenizer, model_cfg = load_pretrained(cfg.pretrained_checkpoint, device, dropout_override=dropout)
+    model, tokenizer, model_cfg = load_pretrained(
+        cfg.pretrained_checkpoint, device,
+        model_cfg_override=cfg.model, dropout_override=dropout,
+    )
     model.gradient_checkpointing = cfg.gradient_checkpointing
 
     if cfg.compile:

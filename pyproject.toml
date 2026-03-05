@@ -14,6 +14,7 @@ dependencies = [
     "accelerate>=0.25",
     "huggingface_hub>=0.20",
     "datasets>=2.25",
+    "safetensors>=0.4",
     "chessgpt @ git+https://github.com/malcouffe/ChessGPT.git",
 ]
 
