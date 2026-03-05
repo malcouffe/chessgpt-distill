@@ -14,7 +14,6 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import glob
 import os
 import signal
 import sys
@@ -279,12 +278,8 @@ def load_pretrained(checkpoint_path: str, device: torch.device, dropout_override
 # ---------------------------------------------------------------------------
 
 
-def save_checkpoint(model, optimizer, scaler, step, cfg, best_val_loss, tokens_seen):
-    os.makedirs(cfg.logging.checkpoint_dir, exist_ok=True)
-    filename = f"distill_step_{step}.pt"
-    path = os.path.join(cfg.logging.checkpoint_dir, filename)
-
-    ckpt = {
+def _make_checkpoint(model, optimizer, scaler, step, cfg, best_val_loss, tokens_seen):
+    return {
         "step": step,
         "model_state_dict": model.state_dict(),
         "optimizer_state_dict": optimizer.state_dict(),
@@ -293,26 +288,17 @@ def save_checkpoint(model, optimizer, scaler, step, cfg, best_val_loss, tokens_s
         "tokens_seen": tokens_seen,
         "config": asdict(cfg),
     }
+
+
+def save_checkpoint(model, optimizer, scaler, step, cfg, best_val_loss, tokens_seen,
+                    filename: str = "last_distill.pt"):
+    os.makedirs(cfg.logging.checkpoint_dir, exist_ok=True)
+    path = os.path.join(cfg.logging.checkpoint_dir, filename)
+
+    ckpt = _make_checkpoint(model, optimizer, scaler, step, cfg, best_val_loss, tokens_seen)
     torch.save(ckpt, path)
 
-    # Symlink latest
-    latest = os.path.join(cfg.logging.checkpoint_dir, "latest_distill.pt")
-    if os.path.islink(latest) or os.path.exists(latest):
-        os.remove(latest)
-    os.symlink(filename, latest)
-
-    print(f"  Checkpoint saved: {path}")
-
-
-def cleanup_old_checkpoints(checkpoint_dir: str, keep: int):
-    if keep <= 0:
-        return
-    files = sorted(
-        glob.glob(os.path.join(checkpoint_dir, "distill_step_*.pt")),
-        key=os.path.getmtime,
-    )
-    for f in files[:-keep]:
-        os.remove(f)
+    print(f"  Checkpoint saved: {path} (step {step})")
 
 
 # ---------------------------------------------------------------------------
@@ -568,15 +554,14 @@ def train(cfg: DistillConfig):
 
                 if cfg.logging.save_best and val_loss < best_val_loss:
                     best_val_loss = val_loss
-                    save_checkpoint(model, optimizer, scaler, step, cfg, best_val_loss, tokens_seen)
-                    print(f"  New best! val_kl_loss={val_loss:.4f}")
+                    save_checkpoint(model, optimizer, scaler, step, cfg, best_val_loss, tokens_seen,
+                                    filename="best_distill.pt")
 
                 t0 = time.time()
 
             # Save
             if step % cfg.logging.save_every == 0:
                 save_checkpoint(model, optimizer, scaler, step, cfg, best_val_loss, tokens_seen)
-                cleanup_old_checkpoints(cfg.logging.checkpoint_dir, cfg.logging.keep_last_n)
 
     # Final save
     save_checkpoint(model, optimizer, scaler, step, cfg, best_val_loss, tokens_seen)
