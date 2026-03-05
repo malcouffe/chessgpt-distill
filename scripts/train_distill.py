@@ -340,6 +340,37 @@ def save_checkpoint(model, optimizer, scaler, step, cfg, best_val_loss, tokens_s
     print(f"  Checkpoint saved: {path} (step {step})")
 
 
+def push_to_hub(cfg: DistillConfig, step: int, is_best: bool = False):
+    """Push checkpoint(s) to HuggingFace Hub."""
+    try:
+        from huggingface_hub import HfApi, upload_file
+
+        hub = cfg.hub
+        if not hub.repo_id:
+            return
+
+        api = HfApi()
+        api.create_repo(repo_id=hub.repo_id, repo_type="model", exist_ok=True)
+
+        # Upload last checkpoint
+        last_path = os.path.join(cfg.logging.checkpoint_dir, "last_distill.pt")
+        if os.path.isfile(last_path):
+            print(f"  [hub] Uploading last_distill.pt to {hub.repo_id} ...")
+            upload_file(path_or_fileobj=last_path, path_in_repo="last_distill.pt", repo_id=hub.repo_id)
+
+        # Upload best checkpoint
+        if is_best:
+            best_path = os.path.join(cfg.logging.checkpoint_dir, "best_distill.pt")
+            if os.path.isfile(best_path):
+                print(f"  [hub] Uploading best_distill.pt to {hub.repo_id} ...")
+                upload_file(path_or_fileobj=best_path, path_in_repo="best_distill.pt", repo_id=hub.repo_id)
+
+        print(f"  [hub] Done: https://huggingface.co/{hub.repo_id}")
+
+    except Exception as e:
+        print(f"  [hub] WARNING: push failed (training continues): {e}")
+
+
 # ---------------------------------------------------------------------------
 # Evaluation
 # ---------------------------------------------------------------------------
@@ -607,12 +638,16 @@ def train(cfg: DistillConfig):
 
                 t0 = time.time()
 
-            # Save
+            # Save + push (best is included if it was updated)
             if step % cfg.logging.save_every == 0:
                 save_checkpoint(model, optimizer, scaler, step, cfg, best_val_loss, tokens_seen)
+                if cfg.hub.push_to_hub:
+                    push_to_hub(cfg, step, is_best=True)
 
     # Final save
     save_checkpoint(model, optimizer, scaler, step, cfg, best_val_loss, tokens_seen)
+    if cfg.hub.push_to_hub:
+        push_to_hub(cfg, step)
     print(f"\nDistillation complete. Final step: {step}")
 
 
