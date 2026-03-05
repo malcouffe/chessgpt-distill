@@ -368,7 +368,10 @@ def evaluate(model, val_loader, device, amp_enabled, amp_dtype):
         selected_logits = logits[batch_indices, position_indices]  # (P, V)
         selected_logits = selected_logits.masked_fill(~legal_masks, float("-inf"))
         log_probs = F.log_softmax(selected_logits, dim=-1)
-        loss = F.kl_div(log_probs, target_probs, reduction="sum")
+        # Compute KL only over legal moves to avoid 0*(log(0)-(-inf))=nan
+        lp = log_probs[legal_masks]
+        tp = target_probs[legal_masks]
+        loss = F.kl_div(lp, tp, reduction="sum")
 
         total_loss += loss.item()
         total_positions += n_positions
@@ -533,7 +536,10 @@ def train(cfg: DistillConfig):
                 selected_logits = selected_logits.masked_fill(~legal_masks, float("-inf"))
 
                 log_probs = F.log_softmax(selected_logits, dim=-1)
-                loss = F.kl_div(log_probs, target_probs, reduction="sum") / total_positions
+                # Compute KL only over legal moves to avoid 0*(log(0)-(-inf))=nan
+                lp = log_probs[legal_masks]
+                tp = target_probs[legal_masks]
+                loss = F.kl_div(lp, tp, reduction="sum") / total_positions
                 # Scale loss for gradient accumulation
                 loss = loss / accum_steps
 

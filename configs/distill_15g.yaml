@@ -1,7 +1,7 @@
 # Stockfish distillation config for 15 GiB GPU (e.g. RTX 4060 Ti 16GB)
 # Fine-tunes a pre-trained ChessGPT using KL-divergence on Stockfish soft targets.
 
-pretrained_checkpoint: "malcouffe/chessgpt"  # REQUIRED: path to pre-trained ChessGPT checkpoint
+pretrained_checkpoint: "checkpoints/pretrained/"  # REQUIRED: path to pre-trained ChessGPT checkpoint
 
 model:
   d_model: 1280
