@@ -240,11 +240,18 @@ def load_distill_data(path: str) -> list[dict]:
 def load_pretrained(checkpoint_path: str, device: torch.device,
                     model_cfg_override: ModelConfig | None = None,
                     dropout_override: float | None = None):
-    """Load a pre-trained ChessGPT model from checkpoint (.pt) or safetensors directory."""
+    """Load a pre-trained ChessGPT model from checkpoint (.pt), safetensors, or HF Hub repo."""
     tokenizer = UCITokenizer()
 
-    # Resolve path: directory → find .safetensors or .pt inside
     path = checkpoint_path
+
+    # HF Hub repo ID (e.g. "malcouffe/chessgpt") → download locally
+    if "/" in path and not os.path.exists(path):
+        from huggingface_hub import snapshot_download
+        print(f"  Downloading from HF Hub: {path} ...")
+        path = snapshot_download(path)
+
+    # Resolve directory → find .safetensors or .pt inside
     if os.path.isdir(path):
         for name in ("model.safetensors", "checkpoint.pt", "latest.pt"):
             candidate = os.path.join(path, name)

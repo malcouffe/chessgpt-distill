@@ -1,7 +1,7 @@
 # Stockfish distillation config for H100 (80GB VRAM)
 # Fine-tunes a pre-trained ChessGPT using KL-divergence on Stockfish soft targets.
 
-pretrained_checkpoint: "checkpoints/pretrained/"
+pretrained_checkpoint: "malcouffe/chessgpt"
 
 model:
   d_model: 1280
