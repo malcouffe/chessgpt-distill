@@ -41,4 +41,4 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
             HF_TOKEN=${{ secrets.HF_TOKEN }}
-            GITHUB_TOKEN=${{ secrets.GITHUB_TOKEN }}
+            GITHUB_TOKEN=${{ secrets.GH_PAT }}
