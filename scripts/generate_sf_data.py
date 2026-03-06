@@ -19,6 +19,8 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import random
+import signal
 import tempfile
 import threading
 import time
@@ -108,12 +110,12 @@ def main():
     parser.add_argument("--output", type=str, default="malcouffe/chessgpt-sf-distill",
                         help="HF Hub repo name (e.g. malcouffe/chessgpt-sf-distill)")
     parser.add_argument("--num_positions", type=int, default=5_000_000)
-    parser.add_argument("--min_elo", type=int, default=1800)
+    parser.add_argument("--min_elo", type=int, default=1000)
     parser.add_argument("--sample_every", type=int, default=8,
                         help="Sample a position every N plies within each game")
-    parser.add_argument("--top_n", type=int, default=10,
+    parser.add_argument("--top_n", type=int, default=5,
                         help="Number of Stockfish top moves to record")
-    parser.add_argument("--sf_depth", type=int, default=18)
+    parser.add_argument("--sf_depth", type=int, default=12)
     parser.add_argument("--max_seq_len", type=int, default=256)
     parser.add_argument("--num_engines", type=int, default=80)
     parser.add_argument("--num_workers", type=int, default=64,
@@ -155,6 +157,17 @@ def main():
     t0 = time.time()
     last_log = t0
 
+    _shutdown_requested = False
+
+    def _handle_signal(signum, frame):
+        nonlocal _shutdown_requested
+        if not _shutdown_requested:
+            _shutdown_requested = True
+            print(f"\n  [{signal.Signals(signum).name}] Graceful shutdown ...", flush=True)
+
+    signal.signal(signal.SIGTERM, _handle_signal)
+    signal.signal(signal.SIGINT, _handle_signal)
+
     with StockfishPool(sf_cfg) as pool, open(local_path, "w") as fout:
         executor = ThreadPoolExecutor(max_workers=args.num_workers)
         pending_futures: dict = {}
@@ -193,51 +206,61 @@ def main():
                 flush=True,
             )
 
+        # Open all dataset streams and interleave randomly
+        print(f"\nOpening {len(args.datasets)} dataset streams...", flush=True)
+        streams = []
         for ds_name in args.datasets:
-            if count >= args.num_positions:
-                break
-
-            print(f"\nLoading {ds_name} ...", flush=True)
+            print(f"  Loading {ds_name} ...", flush=True)
             ds = load_dataset(ds_name, split="train", streaming=True)
+            streams.append(iter(ds))
+        print(f"  {len(streams)} streams ready", flush=True)
 
-            for example in ds:
-                if count >= args.num_positions:
-                    break
+        rng = random.Random(args.seed)
+        active = list(range(len(streams)))
 
-                scanned += 1
+        while active and count < args.num_positions and not _shutdown_requested:
+            # Pick a random stream
+            idx = rng.choice(active)
+            try:
+                example = next(streams[idx])
+            except StopIteration:
+                active.remove(idx)
+                print(f"  Stream {args.datasets[idx]} exhausted, {len(active)} remaining", flush=True)
+                continue
 
-                # Log scanning progress every 10s
-                if scanned % 1000 == 0:
-                    _drain_completed()
-                    _log_progress()
+            scanned += 1
 
-                white_elo = example.get("white_elo", 0)
-                black_elo = example.get("black_elo", 0)
-                if white_elo < args.min_elo or black_elo < args.min_elo:
-                    continue
+            if scanned % 1000 == 0:
+                _drain_completed()
+                _log_progress()
 
-                moves_uci = (example.get("moves_uci") or example.get("moves", "")).strip().split()
-                if len(moves_uci) < 10:
-                    continue
+            white_elo = example.get("white_elo", 0)
+            black_elo = example.get("black_elo", 0)
+            if white_elo < args.min_elo or black_elo < args.min_elo:
+                continue
 
-                filtered += 1
+            moves_uci = (example.get("moves_uci") or example.get("moves", "")).strip().split()
+            if len(moves_uci) < 10:
+                continue
 
-                # Submit immediately — no batching
-                fut = executor.submit(
-                    annotate_game, pool, tokenizer, moves_uci,
-                    sample_every=args.sample_every,
-                    top_n=args.top_n,
-                    sf_depth=args.sf_depth,
-                    max_seq_len=args.max_seq_len,
-                )
-                pending_futures[fut] = True
+            filtered += 1
 
-                # Throttle: if too many in-flight, drain some
-                while len(pending_futures) >= args.num_workers * 3:
-                    _drain_completed()
-                    _log_progress()
-                    if len(pending_futures) >= args.num_workers * 3:
-                        time.sleep(0.1)
+            # Submit immediately — no batching
+            fut = executor.submit(
+                annotate_game, pool, tokenizer, moves_uci,
+                sample_every=args.sample_every,
+                top_n=args.top_n,
+                sf_depth=args.sf_depth,
+                max_seq_len=args.max_seq_len,
+            )
+            pending_futures[fut] = True
+
+            # Throttle: if too many in-flight, drain some
+            while len(pending_futures) >= args.num_workers * 3:
+                _drain_completed()
+                _log_progress()
+                if len(pending_futures) >= args.num_workers * 3:
+                    time.sleep(0.1)
 
         # Drain all remaining futures
         print(f"\nDraining {len(pending_futures)} remaining futures...", flush=True)

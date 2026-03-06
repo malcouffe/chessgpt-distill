@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import random
 import signal
 import sys
 import time
@@ -58,6 +59,7 @@ class DistillDataConfig:
     num_workers: int = 4
     prefetch_factor: int = 2
     sf_temperature: float = 150.0  # temperature for softening SF scores
+    ce_alpha: float = 0.0  # weight for CE loss on SF top-1 move (0 = KL only)
     seed: int = 42
 
 
@@ -77,6 +79,7 @@ class DistillConfig:
     gradient_checkpointing: bool = False
     pretrained_checkpoint: str = ""  # path to pre-trained ChessGPT checkpoint
     resume: str = ""  # path to distillation checkpoint to resume from
+    early_stopping_patience: int = 0  # 0 = disabled, N = stop after N evals without improvement
 
 
 # ---------------------------------------------------------------------------
@@ -469,6 +472,10 @@ def train(cfg: DistillConfig):
     all_data = load_distill_data(cfg.data.train_path)
     print(f"  Total game records: {len(all_data):,}")
 
+    # Shuffle before train/val split to ensure representative validation set
+    random.seed(cfg.data.seed)
+    random.shuffle(all_data)
+
     # Train/val split
     val_size = max(1, int(len(all_data) * cfg.data.val_ratio))
     train_data = all_data[val_size:]
@@ -521,11 +528,16 @@ def train(cfg: DistillConfig):
     model.train()
     step = start_step
     running_loss = 0.0
+    evals_without_improvement = 0
     t0 = time.time()
 
     print(f"\nDistillation training for {cfg.schedule.max_steps} steps")
     print(f"Batch size: {cfg.data.batch_size} x {cfg.optim.grad_accum_steps} accum = {cfg.data.batch_size * cfg.optim.grad_accum_steps} effective")
     print(f"LR: {cfg.optim.learning_rate}, SF temperature: {cfg.data.sf_temperature}")
+    if cfg.data.ce_alpha > 0:
+        print(f"Combined loss: {1 - cfg.data.ce_alpha:.0%} KL + {cfg.data.ce_alpha:.0%} CE")
+    if cfg.early_stopping_patience > 0:
+        print(f"Early stopping: patience {cfg.early_stopping_patience} evals")
     print("-" * 60)
 
     # Graceful shutdown
@@ -577,7 +589,16 @@ def train(cfg: DistillConfig):
                 # Compute KL only over legal moves to avoid 0*(log(0)-(-inf))=nan
                 lp = log_probs[legal_masks]
                 tp = target_probs[legal_masks]
-                loss = F.kl_div(lp, tp, reduction="sum") / total_positions
+                kl_loss = F.kl_div(lp, tp, reduction="sum") / total_positions
+
+                # Combined loss: KL + CE on SF top-1 move
+                if cfg.data.ce_alpha > 0:
+                    top1_targets = target_probs.argmax(dim=-1)  # (P,)
+                    ce_loss = F.cross_entropy(selected_logits, top1_targets)
+                    loss = (1 - cfg.data.ce_alpha) * kl_loss + cfg.data.ce_alpha * ce_loss
+                else:
+                    loss = kl_loss
+
                 # Scale loss for gradient accumulation
                 loss = loss / accum_steps
 
@@ -640,8 +661,16 @@ def train(cfg: DistillConfig):
 
                 if cfg.logging.save_best and val_loss < best_val_loss:
                     best_val_loss = val_loss
+                    evals_without_improvement = 0
                     save_checkpoint(model, optimizer, scaler, step, cfg, best_val_loss, tokens_seen,
                                     filename="best_distill.pt")
+                else:
+                    evals_without_improvement += 1
+
+                # Early stopping
+                if cfg.early_stopping_patience > 0 and evals_without_improvement >= cfg.early_stopping_patience:
+                    print(f"  Early stopping triggered: no improvement for {evals_without_improvement} evals (best val_kl_loss={best_val_loss:.4f})")
+                    done = True
 
                 t0 = time.time()
 

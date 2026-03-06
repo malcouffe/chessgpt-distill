@@ -18,7 +18,8 @@ data:
   max_seq_len: 256
   num_workers: 4
   prefetch_factor: 4
-  sf_temperature: 150.0
+  sf_temperature: 100.0
+  ce_alpha: 0.1  # 90% KL + 10% CE on SF top-1 move
   seed: 42
 
 optim:
@@ -32,6 +33,8 @@ schedule:
   warmup_steps: 500
   max_steps: 12000
   min_lr_ratio: 0.1
+
+early_stopping_patience: 5  # stop after 5 evals (2500 steps) without val improvement
 
 logging:
   log_every: 50
