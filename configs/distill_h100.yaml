@@ -49,4 +49,4 @@ use_amp: true
 amp_dtype: "bf16"
 compile: true
 compile_mode: "default"
-gradient_checkpointing: false
+gradient_checkpointing: true
