@@ -5,12 +5,15 @@ For each game, samples multiple positions and records the top-N Stockfish
 moves with centipawn evaluations plus all legal move token IDs.
 One JSONL record per game with multiple annotated positions.
 
+Uses multiprocessing (not threads) to bypass the GIL and fully utilize
+all CPU cores for Stockfish evaluation.
+
 Usage:
     python scripts/generate_sf_data.py \
         --output malcouffe/chessgpt-sf-distill \
         --num_positions 5000000 \
-        --sf_depth 18 \
-        --num_engines 8 \
+        --sf_depth 12 \
+        --num_workers 96 \
         --sample_every 8
 """
 
@@ -22,21 +25,44 @@ import os
 import random
 import signal
 import tempfile
-import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, as_completed
 
 import chess
+import chess.engine
 from datasets import Dataset, load_dataset
 
 from chessgpt import UCITokenizer
-from chessgpt_distill.stockfish import StockfishConfig, StockfishPool
+
+# ---------------------------------------------------------------------------
+# Per-worker Stockfish engine (one per process, no sharing)
+# ---------------------------------------------------------------------------
+
+_worker_engine: chess.engine.SimpleEngine | None = None
+_worker_sf_path: str = ""
+
+
+def _init_worker(sf_path: str):
+    """Initialize a Stockfish engine in this worker process."""
+    global _worker_engine, _worker_sf_path
+    _worker_sf_path = sf_path
+    _worker_engine = chess.engine.SimpleEngine.popen_uci(sf_path)
+    _worker_engine.configure({"Threads": 1, "Hash": 64})
+
+
+MATE_SCORE = 10_000
+
+
+def _score_to_cp(score) -> int:
+    if score.is_mate():
+        return MATE_SCORE if score.mate() > 0 else -MATE_SCORE
+    return score.score()
 
 
 def annotate_game(
-    pool: StockfishPool,
-    tokenizer: UCITokenizer,
     moves_uci: list[str],
+    move_to_id: dict[str, int],
+    bos_id: int,
     sample_every: int,
     top_n: int,
     sf_depth: int,
@@ -44,13 +70,15 @@ def annotate_game(
 ) -> tuple[dict | None, int]:
     """Annotate multiple sampled positions from a single game.
 
-    Returns (record, num_positions) where record is a dict with tokens and
-    annotations, or (None, 0) if no valid annotations were produced.
+    Runs in a worker process with its own Stockfish engine.
     """
+    global _worker_engine
+    engine = _worker_engine
+
     # Build full token sequence
-    tokens = [tokenizer.BOS_ID]
+    tokens = [bos_id]
     for mv in moves_uci:
-        tid = tokenizer.move_to_id.get(mv)
+        tid = move_to_id.get(mv)
         if tid is not None:
             tokens.append(tid)
 
@@ -65,36 +93,39 @@ def annotate_game(
     board = chess.Board()
 
     for ply, mv_uci in enumerate(moves_uci):
-        # Check if this ply should be sampled
         if ply >= 4 and ply < len(moves_uci) - 1 and (ply - 4) % sample_every == 0:
             if not board.is_game_over() and board.legal_moves.count() > 0:
-                # Token index for this position (ply+1 because of BOS)
                 token_pos = ply + 1 - offset
                 if 0 <= token_pos < len(tokens):
-                    top_moves = pool.top_moves(board, n=top_n, depth=sf_depth)
+                    n = min(top_n, board.legal_moves.count())
+                    if n > 0:
+                        infos = engine.analyse(
+                            board, chess.engine.Limit(depth=sf_depth), multipv=n,
+                        )
+                        sf_targets = []
+                        for info in infos:
+                            move_uci_str = info["pv"][0].uci()
+                            score_cp = _score_to_cp(info["score"].white())
+                            tid = move_to_id.get(move_uci_str)
+                            if tid is not None:
+                                sf_targets.append({
+                                    "token_id": tid,
+                                    "move": move_uci_str,
+                                    "score_cp": score_cp,
+                                })
 
-                    sf_targets = []
-                    for move_uci, score_cp in top_moves:
-                        tid = tokenizer.move_to_id.get(move_uci)
-                        if tid is not None:
-                            sf_targets.append({
-                                "token_id": tid,
-                                "move": move_uci,
-                                "score_cp": score_cp,
+                        legal_move_ids = []
+                        for legal_mv in board.legal_moves:
+                            tid = move_to_id.get(legal_mv.uci())
+                            if tid is not None:
+                                legal_move_ids.append(tid)
+
+                        if sf_targets and legal_move_ids:
+                            annotations.append({
+                                "position_index": token_pos,
+                                "sf_targets": sf_targets,
+                                "legal_move_ids": legal_move_ids,
                             })
-
-                    legal_move_ids = []
-                    for legal_mv in board.legal_moves:
-                        tid = tokenizer.move_to_id.get(legal_mv.uci())
-                        if tid is not None:
-                            legal_move_ids.append(tid)
-
-                    if sf_targets and legal_move_ids:
-                        annotations.append({
-                            "position_index": token_pos,
-                            "sf_targets": sf_targets,
-                            "legal_move_ids": legal_move_ids,
-                        })
 
         board.push_uci(mv_uci)
 
@@ -103,6 +134,11 @@ def annotate_game(
 
     record = {"tokens": tokens, "annotations": annotations}
     return record, len(annotations)
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
 
 
 def main():
@@ -117,9 +153,8 @@ def main():
                         help="Number of Stockfish top moves to record")
     parser.add_argument("--sf_depth", type=int, default=12)
     parser.add_argument("--max_seq_len", type=int, default=256)
-    parser.add_argument("--num_engines", type=int, default=80)
-    parser.add_argument("--num_workers", type=int, default=64,
-                        help="Number of parallel game annotation threads")
+    parser.add_argument("--num_workers", type=int, default=96,
+                        help="Number of parallel worker processes (each with its own SF engine)")
     parser.add_argument("--stockfish_path", type=str, default="stockfish")
     parser.add_argument("--datasets", nargs="+", default=[
         "malcouffe/lichess-standard-rated-2025-07-uci",
@@ -134,18 +169,15 @@ def main():
     args = parser.parse_args()
 
     tokenizer = UCITokenizer()
-
-    sf_cfg = StockfishConfig(
-        binary_path=args.stockfish_path,
-        depth=args.sf_depth,
-        num_engines=args.num_engines,
-    )
+    # Extract serializable data for worker processes (can't pickle tokenizer)
+    move_to_id = dict(tokenizer.move_to_id)
+    bos_id = tokenizer.BOS_ID
 
     local_path = os.path.join(tempfile.gettempdir(), "sf_distill.jsonl")
 
     print(f"Target: {args.num_positions:,} positions")
-    print(f"Stockfish: depth={args.sf_depth}, top_n={args.top_n}, engines={args.num_engines}")
-    print(f"Workers: {args.num_workers}")
+    print(f"Stockfish: depth={args.sf_depth}, top_n={args.top_n}")
+    print(f"Workers: {args.num_workers} (multiprocessing, 1 SF engine per worker)")
     print(f"Max seq len: {args.max_seq_len}")
     print(f"Datasets: {len(args.datasets)}")
     print(f"HF Hub repo: {args.output}")
@@ -168,21 +200,22 @@ def main():
     signal.signal(signal.SIGTERM, _handle_signal)
     signal.signal(signal.SIGINT, _handle_signal)
 
-    with StockfishPool(sf_cfg) as pool, open(local_path, "w") as fout:
-        executor = ThreadPoolExecutor(max_workers=args.num_workers)
+    with open(local_path, "w") as fout:
+        executor = ProcessPoolExecutor(
+            max_workers=args.num_workers,
+            initializer=_init_worker,
+            initargs=(args.stockfish_path,),
+        )
         pending_futures: dict = {}
-        write_lock = threading.Lock()
 
         def _drain_completed():
-            """Drain completed futures and write results."""
             nonlocal count, games
             done = [f for f in pending_futures if f.done()]
             for f in done:
                 del pending_futures[f]
                 record, n_positions = f.result()
                 if record is not None:
-                    with write_lock:
-                        fout.write(json.dumps(record, ensure_ascii=False) + "\n")
+                    fout.write(json.dumps(record, ensure_ascii=False) + "\n")
                     count += n_positions
                     games += 1
 
@@ -245,9 +278,8 @@ def main():
 
             filtered += 1
 
-            # Submit immediately — no batching
             fut = executor.submit(
-                annotate_game, pool, tokenizer, moves_uci,
+                annotate_game, moves_uci, move_to_id, bos_id,
                 sample_every=args.sample_every,
                 top_n=args.top_n,
                 sf_depth=args.sf_depth,
