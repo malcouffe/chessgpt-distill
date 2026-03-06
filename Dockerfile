@@ -15,7 +15,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends git gcc \
 
 COPY pyproject.toml .
 COPY chessgpt_distill/ chessgpt_distill/
-RUN pip install --no-cache-dir -e .
+RUN pip install --no-cache-dir .
 
 COPY scripts/ scripts/
 COPY configs/ configs/
