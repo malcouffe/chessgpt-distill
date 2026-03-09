@@ -277,6 +277,9 @@ def load_pretrained(checkpoint_path: str, device: torch.device,
     if path.endswith(".safetensors"):
         from safetensors.torch import load_file
         state_dict = load_file(path, device=str(device))
+        # Strip "model." prefix if present (HF Hub saves wrap in a parent module)
+        if any(k.startswith("model.") for k in state_dict):
+            state_dict = {k.removeprefix("model."): v for k, v in state_dict.items()}
         step = 0
 
         # Use config from yaml (model_cfg_override) since safetensors has no config
