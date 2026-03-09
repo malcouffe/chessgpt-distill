@@ -9,7 +9,7 @@ model:
   n_heads: 20
   d_ff: 3584
   max_seq_len: 256
-  dropout: 0.05
+  dropout: 0.0
 
 data:
   train_path: "malcouffe/chessgpt-sf-distill"
@@ -20,6 +20,7 @@ data:
   prefetch_factor: 4
   sf_temperature: 100.0
   ce_alpha: 0.1  # 90% KL + 10% CE on SF top-1 move
+  value_alpha: 0.2  # weight for value head MSE loss
   seed: 42
 
 optim:
