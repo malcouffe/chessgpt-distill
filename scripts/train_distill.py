@@ -14,8 +14,8 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import math
 import os
-import random
 import signal
 import sys
 import time
@@ -60,6 +60,7 @@ class DistillDataConfig:
     prefetch_factor: int = 2
     sf_temperature: float = 150.0  # temperature for softening SF scores
     ce_alpha: float = 0.0  # weight for CE loss on SF top-1 move (0 = KL only)
+    value_alpha: float = 0.5  # weight for value MSE loss
     seed: int = 42
 
 
@@ -134,6 +135,7 @@ class StockfishDistillDataset(Dataset):
         position_indices = []
         target_probs_list = []
         legal_masks_list = []
+        value_targets_list = []
 
         for ann in item["annotations"]:
             pos_idx = ann["position_index"] - offset
@@ -164,6 +166,11 @@ class StockfishDistillDataset(Dataset):
             # Softmax over legal moves only (illegal stays -inf → 0 probability)
             target_probs = F.softmax(target_logits, dim=0)
 
+            # Value target: SF's best move score normalised to [-1, +1] (white's perspective)
+            # sf_targets[0] is always SF's top-1 move (best for side-to-move)
+            best_cp = sf_targets[0]["score_cp"]
+            value_targets_list.append(math.tanh(best_cp / 400.0))
+
             position_indices.append(pos_idx)
             target_probs_list.append(target_probs)
             legal_masks_list.append(legal_mask)
@@ -176,6 +183,7 @@ class StockfishDistillDataset(Dataset):
                 "position_indices": torch.zeros(1, dtype=torch.long),
                 "target_probs": torch.zeros(1, self.vocab_size),
                 "legal_masks": torch.zeros(1, self.vocab_size, dtype=torch.bool),
+                "value_targets": torch.zeros(1),
             }
 
         return {
@@ -184,6 +192,7 @@ class StockfishDistillDataset(Dataset):
             "position_indices": torch.tensor(position_indices, dtype=torch.long),
             "target_probs": torch.stack(target_probs_list),   # (P, V)
             "legal_masks": torch.stack(legal_masks_list),      # (P, V)
+            "value_targets": torch.tensor(value_targets_list, dtype=torch.float32),  # (P,)
         }
 
 
@@ -198,6 +207,7 @@ def distill_collate_fn(batch: list[dict]) -> dict:
     all_position_indices = []
     all_target_probs = []
     all_legal_masks = []
+    all_value_targets = []
 
     for b_idx, b in enumerate(batch):
         n = b["num_positions"]
@@ -207,6 +217,7 @@ def distill_collate_fn(batch: list[dict]) -> dict:
         all_position_indices.append(b["position_indices"])
         all_target_probs.append(b["target_probs"])
         all_legal_masks.append(b["legal_masks"])
+        all_value_targets.append(b["value_targets"])
 
     if not all_position_indices:
         V = batch[0]["target_probs"].shape[-1]
@@ -216,6 +227,7 @@ def distill_collate_fn(batch: list[dict]) -> dict:
             "position_indices": torch.zeros(0, dtype=torch.long),
             "target_probs": torch.zeros(0, V),
             "legal_masks": torch.zeros(0, V, dtype=torch.bool),
+            "value_targets": torch.zeros(0),
             "total_positions": 0,
         }
 
@@ -225,14 +237,14 @@ def distill_collate_fn(batch: list[dict]) -> dict:
         "position_indices": torch.cat(all_position_indices),
         "target_probs": torch.cat(all_target_probs),
         "legal_masks": torch.cat(all_legal_masks),
+        "value_targets": torch.cat(all_value_targets),
         "total_positions": len(all_batch_indices),
     }
 
 
-def load_distill_data(path: str) -> list[dict]:
-    """Load distillation data from a HF Hub dataset."""
-    ds = hf_load_dataset(path, split="train")
-    return [row for row in ds]
+def load_distill_data(path: str):
+    """Load distillation data from a HF Hub dataset (memory-mapped Arrow)."""
+    return hf_load_dataset(path, split="train")
 
 
 # ---------------------------------------------------------------------------
@@ -287,7 +299,11 @@ def load_pretrained(checkpoint_path: str, device: torch.device,
         )
 
         model = ChessGPT(model_cfg).to(device)
-        model.load_state_dict(state_dict, strict=False)
+        info = model.load_state_dict(state_dict, strict=False)
+        if info.missing_keys:
+            print(f"  Missing keys (randomly initialised): {info.missing_keys}")
+        if info.unexpected_keys:
+            print(f"  Unexpected keys (ignored): {info.unexpected_keys}")
 
     else:
         ckpt = torch.load(path, map_location=device, weights_only=False)
@@ -312,7 +328,11 @@ def load_pretrained(checkpoint_path: str, device: torch.device,
         )
 
         model = ChessGPT(model_cfg).to(device)
-        model.load_state_dict(ckpt["model_state_dict"], strict=False)
+        info = model.load_state_dict(ckpt["model_state_dict"], strict=False)
+        if info.missing_keys:
+            print(f"  Missing keys (randomly initialised): {info.missing_keys}")
+        if info.unexpected_keys:
+            print(f"  Unexpected keys (ignored): {info.unexpected_keys}")
         step = ckpt.get("step", 0)
 
     print(f"  Loaded pre-trained model from step {step}, params: {model.count_parameters():,}")
@@ -389,7 +409,8 @@ def push_to_hub(cfg: DistillConfig, step: int, is_best: bool = False):
 @torch.no_grad()
 def evaluate(model, val_loader, device, amp_enabled, amp_dtype):
     model.eval()
-    total_loss = 0.0
+    total_policy_loss = 0.0
+    total_value_loss = 0.0
     total_positions = 0
 
     for batch in val_loader:
@@ -402,9 +423,10 @@ def evaluate(model, val_loader, device, amp_enabled, amp_dtype):
         position_indices = batch["position_indices"].to(device)
         target_probs = batch["target_probs"].to(device)
         legal_masks = batch["legal_masks"].to(device)
+        value_targets = batch["value_targets"].to(device)
 
         with torch.amp.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_enabled):
-            logits, _ = model(input_ids)
+            logits, values, _ = model(input_ids)
 
         selected_logits = logits[batch_indices, position_indices]  # (P, V)
         selected_logits = selected_logits.masked_fill(~legal_masks, float("-inf"))
@@ -412,13 +434,19 @@ def evaluate(model, val_loader, device, amp_enabled, amp_dtype):
         # Compute KL only over legal moves to avoid 0*(log(0)-(-inf))=nan
         lp = log_probs[legal_masks]
         tp = target_probs[legal_masks]
-        loss = F.kl_div(lp, tp, reduction="sum")
+        policy_loss = F.kl_div(lp, tp, reduction="sum")
 
-        total_loss += loss.item()
+        selected_values = values[batch_indices, position_indices]
+        value_loss = F.mse_loss(selected_values, value_targets, reduction="sum")
+
+        total_policy_loss += policy_loss.item()
+        total_value_loss += value_loss.item()
         total_positions += n_positions
 
     model.train()
-    return total_loss / max(total_positions, 1)
+    avg_policy = total_policy_loss / max(total_positions, 1)
+    avg_value = total_value_loss / max(total_positions, 1)
+    return avg_policy, avg_value
 
 
 # ---------------------------------------------------------------------------
@@ -473,13 +501,12 @@ def train(cfg: DistillConfig):
     print(f"  Total game records: {len(all_data):,}")
 
     # Shuffle before train/val split to ensure representative validation set
-    random.seed(cfg.data.seed)
-    random.shuffle(all_data)
+    all_data = all_data.shuffle(seed=cfg.data.seed)
 
     # Train/val split
     val_size = max(1, int(len(all_data) * cfg.data.val_ratio))
-    train_data = all_data[val_size:]
-    val_data = all_data[:val_size]
+    train_data = all_data.select(range(val_size, len(all_data)))
+    val_data = all_data.select(range(val_size))
     print(f"  Train: {len(train_data):,}, Val: {len(val_data):,}")
 
     train_dataset = StockfishDistillDataset(
@@ -528,6 +555,8 @@ def train(cfg: DistillConfig):
     model.train()
     step = start_step
     running_loss = 0.0
+    running_policy_loss = 0.0
+    running_value_loss = 0.0
     evals_without_improvement = 0
     t0 = time.time()
 
@@ -575,11 +604,12 @@ def train(cfg: DistillConfig):
             position_indices = batch["position_indices"].to(device)
             target_probs = batch["target_probs"].to(device)
             legal_masks = batch["legal_masks"].to(device)
+            value_targets = batch["value_targets"].to(device)
 
             with torch.amp.autocast(
                 device_type=device.type, dtype=amp_dtype, enabled=amp_enabled,
             ):
-                logits, _ = model(input_ids)
+                logits, values, _ = model(input_ids)
 
                 # Gather logits at all annotated positions
                 selected_logits = logits[batch_indices, position_indices]  # (P_total, V)
@@ -591,13 +621,19 @@ def train(cfg: DistillConfig):
                 tp = target_probs[legal_masks]
                 kl_loss = F.kl_div(lp, tp, reduction="sum") / total_positions
 
-                # Combined loss: KL + CE on SF top-1 move
+                # Combined policy loss: KL + CE on SF top-1 move
                 if cfg.data.ce_alpha > 0:
                     top1_targets = target_probs.argmax(dim=-1)  # (P,)
                     ce_loss = F.cross_entropy(selected_logits, top1_targets)
-                    loss = (1 - cfg.data.ce_alpha) * kl_loss + cfg.data.ce_alpha * ce_loss
+                    policy_loss = (1 - cfg.data.ce_alpha) * kl_loss + cfg.data.ce_alpha * ce_loss
                 else:
-                    loss = kl_loss
+                    policy_loss = kl_loss
+
+                # Value loss
+                selected_values = values[batch_indices, position_indices]
+                value_loss = F.mse_loss(selected_values, value_targets)
+
+                loss = policy_loss + cfg.data.value_alpha * value_loss
 
                 # Scale loss for gradient accumulation
                 loss = loss / accum_steps
@@ -605,7 +641,9 @@ def train(cfg: DistillConfig):
             scaler.scale(loss).backward()
 
             running_loss += loss.item() * accum_steps  # undo scaling for logging
-            tokens_seen += input_ids.numel()
+            running_policy_loss += policy_loss.item()
+            running_value_loss += value_loss.item()
+            tokens_seen += (input_ids != 0).sum().item()  # exclude PAD tokens
             micro_step += 1
 
             # Only step optimizer after accumulating enough micro-batches
@@ -634,6 +672,8 @@ def train(cfg: DistillConfig):
             # Logging
             if step % cfg.logging.log_every == 0:
                 avg_loss = running_loss / cfg.logging.log_every
+                avg_ploss = running_policy_loss / cfg.logging.log_every
+                avg_vloss = running_value_loss / cfg.logging.log_every
                 elapsed = time.time() - t0
                 sps = cfg.logging.log_every / elapsed
 
@@ -644,7 +684,9 @@ def train(cfg: DistillConfig):
 
                 print(
                     f"step {step:>7d} | "
-                    f"kl_loss {avg_loss:.4f} | "
+                    f"loss {avg_loss:.4f} | "
+                    f"policy {avg_ploss:.4f} | "
+                    f"value {avg_vloss:.4f} | "
                     f"lr {lr:.2e} | "
                     f"grad {grad_norm:.2f} | "
                     f"tokens {tokens_seen / 1e9:.2f}B | "
@@ -652,18 +694,24 @@ def train(cfg: DistillConfig):
                     f"{vram_str}"
                 )
                 running_loss = 0.0
+                running_policy_loss = 0.0
+                running_value_loss = 0.0
                 t0 = time.time()
 
             # Eval
             if step % cfg.logging.eval_every == 0:
-                val_loss = evaluate(model, val_loader, device, amp_enabled, amp_dtype)
-                print(f"step {step:>7d} | val_kl_loss {val_loss:.4f}")
+                val_policy, val_value = evaluate(model, val_loader, device, amp_enabled, amp_dtype)
+                val_loss = val_policy
+                print(f"step {step:>7d} | val_policy {val_policy:.4f} | val_value {val_value:.4f}")
 
-                if cfg.logging.save_best and val_loss < best_val_loss:
+                is_new_best = cfg.logging.save_best and val_loss < best_val_loss
+                if is_new_best:
                     best_val_loss = val_loss
                     evals_without_improvement = 0
                     save_checkpoint(model, optimizer, scaler, step, cfg, best_val_loss, tokens_seen,
                                     filename="best_distill.pt")
+                    if cfg.hub.push_to_hub:
+                        push_to_hub(cfg, step, is_best=True)
                 else:
                     evals_without_improvement += 1
 
@@ -674,11 +722,9 @@ def train(cfg: DistillConfig):
 
                 t0 = time.time()
 
-            # Save + push (best is included if it was updated)
+            # Periodic save (no push — push only on new best or at end)
             if step % cfg.logging.save_every == 0:
                 save_checkpoint(model, optimizer, scaler, step, cfg, best_val_loss, tokens_seen)
-                if cfg.hub.push_to_hub:
-                    push_to_hub(cfg, step, is_best=True)
 
     # Final save
     save_checkpoint(model, optimizer, scaler, step, cfg, best_val_loss, tokens_seen)
@@ -694,7 +740,7 @@ def train(cfg: DistillConfig):
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Stockfish distillation for ChessGPT")
-    parser.add_argument("--config", type=str, default="configs/distill_15g.yaml")
+    parser.add_argument("--config", type=str, default="configs/distill_h100.yaml")
     parser.add_argument("--set", nargs="*", default=[], dest="overrides")
     return parser.parse_args()
 
