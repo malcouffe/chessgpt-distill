@@ -280,6 +280,12 @@ def load_pretrained(checkpoint_path: str, device: torch.device,
         # Strip "model." prefix if present (HF Hub saves wrap in a parent module)
         if any(k.startswith("model.") for k in state_dict):
             state_dict = {k.removeprefix("model."): v for k, v in state_dict.items()}
+        # Remap HF naming conventions to ChessGPT naming
+        key_map = {"embed_tokens.weight": "token_emb.weight"}
+        state_dict = {key_map.get(k, k): v for k, v in state_dict.items()}
+        # head.weight is tied to token_emb.weight
+        if "head.weight" not in state_dict and "token_emb.weight" in state_dict:
+            state_dict["head.weight"] = state_dict["token_emb.weight"]
         step = 0
 
         # Use config from yaml (model_cfg_override) since safetensors has no config
