@@ -380,7 +380,11 @@ def save_checkpoint(model, optimizer, scaler, step, cfg, best_val_loss, tokens_s
 
 
 def push_to_hub(cfg: DistillConfig, step: int, is_best: bool = False):
-    """Push checkpoint(s) to HuggingFace Hub."""
+    """Push checkpoint(s) to HuggingFace Hub.
+
+    When is_best=True, only uploads best_distill.pt.
+    When is_best=False (final save), only uploads last_distill.pt.
+    """
     try:
         from huggingface_hub import HfApi, upload_file
 
@@ -391,18 +395,18 @@ def push_to_hub(cfg: DistillConfig, step: int, is_best: bool = False):
         api = HfApi()
         api.create_repo(repo_id=hub.repo_id, repo_type="model", exist_ok=True)
 
-        # Upload last checkpoint
-        last_path = os.path.join(cfg.logging.checkpoint_dir, "last_distill.pt")
-        if os.path.isfile(last_path):
-            print(f"  [hub] Uploading last_distill.pt to {hub.repo_id} ...")
-            upload_file(path_or_fileobj=last_path, path_in_repo="last_distill.pt", repo_id=hub.repo_id)
-
-        # Upload best checkpoint
         if is_best:
+            # Upload best checkpoint only
             best_path = os.path.join(cfg.logging.checkpoint_dir, "best_distill.pt")
             if os.path.isfile(best_path):
                 print(f"  [hub] Uploading best_distill.pt to {hub.repo_id} ...")
                 upload_file(path_or_fileobj=best_path, path_in_repo="best_distill.pt", repo_id=hub.repo_id)
+        else:
+            # Upload last checkpoint (final save / resume)
+            last_path = os.path.join(cfg.logging.checkpoint_dir, "last_distill.pt")
+            if os.path.isfile(last_path):
+                print(f"  [hub] Uploading last_distill.pt to {hub.repo_id} ...")
+                upload_file(path_or_fileobj=last_path, path_in_repo="last_distill.pt", repo_id=hub.repo_id)
 
         print(f"  [hub] Done: https://huggingface.co/{hub.repo_id}")
 
@@ -567,6 +571,7 @@ def train(cfg: DistillConfig):
     running_policy_loss = 0.0
     running_value_loss = 0.0
     evals_without_improvement = 0
+    last_hub_push_step = 0
     t0 = time.time()
 
     print(f"\nDistillation training for {cfg.schedule.max_steps} steps")
@@ -719,8 +724,10 @@ def train(cfg: DistillConfig):
                     evals_without_improvement = 0
                     save_checkpoint(model, optimizer, scaler, step, cfg, best_val_loss, tokens_seen,
                                     filename="best_distill.pt")
-                    if cfg.hub.push_to_hub:
+                    # Throttle hub uploads: only push best every save_every steps
+                    if cfg.hub.push_to_hub and (step - last_hub_push_step) >= cfg.logging.save_every:
                         push_to_hub(cfg, step, is_best=True)
+                        last_hub_push_step = step
                 else:
                     evals_without_improvement += 1
 
