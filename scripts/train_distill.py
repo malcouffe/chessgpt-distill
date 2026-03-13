@@ -356,10 +356,16 @@ def load_pretrained(checkpoint_path: str, device: torch.device,
 # ---------------------------------------------------------------------------
 
 
+def _unwrap_state_dict(model):
+    """Get state dict without torch.compile's '_orig_mod.' prefix."""
+    sd = model.state_dict()
+    return {k.removeprefix("_orig_mod."): v for k, v in sd.items()}
+
+
 def _make_checkpoint(model, optimizer, scaler, step, cfg, best_val_loss, tokens_seen):
     return {
         "step": step,
-        "model_state_dict": model.state_dict(),
+        "model_state_dict": _unwrap_state_dict(model),
         "optimizer_state_dict": optimizer.state_dict(),
         "scaler_state_dict": scaler.state_dict(),
         "best_val_loss": best_val_loss,

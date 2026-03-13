@@ -50,7 +50,14 @@ def load_checkpoint(checkpoint_path: str, device: torch.device):
     )
 
     model = ChessGPT(model_cfg).to(device)
-    model.load_state_dict(ckpt["model_state_dict"], strict=False)
+    # Strip torch.compile's '_orig_mod.' prefix if present
+    state_dict = ckpt["model_state_dict"]
+    state_dict = {k.removeprefix("_orig_mod."): v for k, v in state_dict.items()}
+    info = model.load_state_dict(state_dict, strict=False)
+    if info.missing_keys:
+        print(f"  WARNING: missing keys: {info.missing_keys}")
+    if info.unexpected_keys:
+        print(f"  WARNING: unexpected keys: {info.unexpected_keys}")
     model.eval()
 
     step = ckpt.get("step", "?")
