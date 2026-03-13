@@ -40,7 +40,6 @@ early_stopping_patience: 5  # stop after 5 evals (2500 steps) without val improv
 logging:
   log_every: 50
   eval_every: 500
-  eval_steps: 100
   save_every: 2000
   checkpoint_dir: "/tmp/checkpoints/distill"
   save_best: true

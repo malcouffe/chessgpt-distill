@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
@@ -99,7 +100,7 @@ def _get_model_top1(
     input_ids = torch.tensor([ids], dtype=torch.long, device=device)
 
     with torch.amp.autocast(device_type=device.type, enabled=(device.type == "cuda")):
-        logits, _ = model(input_ids)
+        logits, _, _ = model(input_ids)
 
     logits = logits[0, -1, :]  # (V,)
 
@@ -249,6 +250,12 @@ def legality_rate(
     return legal / total if total > 0 else 0.0
 
 
+MoveSelector = Callable[
+    [ChessGPT, UCITokenizer, list[str], chess.Board, torch.device],
+    str | None,
+]
+
+
 def full_evaluation(
     model: ChessGPT,
     tokenizer: UCITokenizer,
@@ -256,11 +263,13 @@ def full_evaluation(
     pool: StockfishPool,
     device: torch.device,
     sf_depth: int = 15,
+    move_selector: MoveSelector | None = None,
 ) -> EvalResult:
     """Run all evaluation metrics on a set of positions.
 
-    This is more efficient than calling individual metric functions because
-    it does only one forward pass per position.
+    If move_selector is provided, it is used instead of the default greedy
+    top-1 (no legal masking). The selector receives (model, tokenizer,
+    move_history, board, device) and returns a UCI move string or None.
     """
     # Per-position accumulators
     top1_matches = 0
@@ -283,10 +292,15 @@ def full_evaluation(
 
         total += 1
 
-        # Model prediction (no legal masking)
-        model_move, is_legal = _get_model_top1(
-            model, tokenizer, pos.move_history, device,
-        )
+        if move_selector is not None:
+            model_move = move_selector(model, tokenizer, pos.move_history, board, device)
+            # Custom selectors are assumed to return legal moves
+            is_legal = model_move is not None
+        else:
+            # Default: greedy top-1 without legal masking
+            model_move, is_legal = _get_model_top1(
+                model, tokenizer, pos.move_history, device,
+            )
 
         if is_legal:
             legal_count += 1

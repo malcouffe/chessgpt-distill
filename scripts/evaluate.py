@@ -50,7 +50,7 @@ def load_checkpoint(checkpoint_path: str, device: torch.device):
     )
 
     model = ChessGPT(model_cfg).to(device)
-    model.load_state_dict(ckpt["model_state_dict"])
+    model.load_state_dict(ckpt["model_state_dict"], strict=False)
     model.eval()
 
     step = ckpt.get("step", "?")
@@ -91,6 +91,11 @@ def main():
     parser.add_argument("--num_engines", type=int, default=4)
     parser.add_argument("--max_positions", type=int, default=0,
                         help="Limit number of positions (0 = all)")
+    parser.add_argument("--search", type=str, default="greedy",
+                        choices=["greedy", "greedy_legal", "mcts", "mcts_sf"],
+                        help="Move selection strategy")
+    parser.add_argument("--mcts_simulations", type=int, default=100)
+    parser.add_argument("--mcts_cpuct", type=float, default=1.5)
     args = parser.parse_args()
 
     device = resolve_device(args.device)
@@ -120,8 +125,36 @@ def main():
     )
     print(f"Starting Stockfish pool ({sf_cfg.num_engines} engines, depth {sf_cfg.depth})")
 
+    # Build move selector
+    move_selector = None
+    if args.search == "greedy_legal":
+        from chessgpt_distill.search import search_greedy_legal
+        move_selector = search_greedy_legal
+    elif args.search == "mcts":
+        from chessgpt_distill.search import mcts_search
+        from functools import partial
+        move_selector = partial(
+            mcts_search,
+            num_simulations=args.mcts_simulations,
+            c_puct=args.mcts_cpuct,
+        )
+    elif args.search == "mcts_sf":
+        # mcts_sf needs the pool — will be set inside the context manager
+        pass
+
     with StockfishPool(sf_cfg) as pool:
-        print("\nRunning evaluation...")
+        if args.search == "mcts_sf":
+            from chessgpt_distill.search import mcts_search_sf
+            from functools import partial
+            move_selector = partial(
+                mcts_search_sf,
+                pool=pool,
+                sf_depth=3,
+                num_simulations=args.mcts_simulations,
+                c_puct=args.mcts_cpuct,
+            )
+
+        print(f"\nRunning evaluation (search={args.search})...")
         t0 = time.time()
         result = full_evaluation(
             model=model,
@@ -130,6 +163,7 @@ def main():
             pool=pool,
             device=device,
             sf_depth=args.sf_depth,
+            move_selector=move_selector,
         )
         elapsed = time.time() - t0
 
